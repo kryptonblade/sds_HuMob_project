@@ -1,0 +1,4 @@
+# Ignore data, predictions, and checkpoints folders
+Data/
+predictions/
+checkpoints/
