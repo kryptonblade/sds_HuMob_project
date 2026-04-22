@@ -1,159 +1,328 @@
 import pandas as pd
 import numpy as np
+from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
-from geobleu.geobleu.seq_eval import calc_geobleu_single
 from tqdm import tqdm
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-DATA_PATH = Path.home() / "Downloads" / "city_A_alldata.parquet"
-TRAIN_DAYS = (1, 60)
-TEST_DAYS = (61, 75)
-USE_PARALLEL = True
-
+import gc
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
 
 # =========================================================
-# LOAD DATA
+# DATASET (FAST + MEMORY SAFE)
 # =========================================================
-def load_data(path):
-    print(f"Loading data from {path} ...")
-    df = pd.read_parquet(path)
-    
-    df = df.astype({
-        'uid': 'int32',
-        'd': 'int16',
-        't': 'int16',
-        'x': 'int32',
-        'y': 'int32'
-    })
-    
-    print(f"Loaded {len(df)} rows")
-    return df
 
+class MobTimeSeriesDataset(Dataset):
+    def __init__(self, dataset,
+                 input_seq_length,
+                 predict_seq_length,
+                 subsample=False,
+                 subsample_number=100,
+                 look_back_len=24,
+                 multiple=2):
 
-# =========================================================
-# PREPROCESS (sorting removed)
-# =========================================================
-def preprocess(df):
-    print("Splitting train/test...")
-    
-    df_train = df[(df['d'] >= TRAIN_DAYS[0]) & (df['d'] <= TRAIN_DAYS[1])]
-    df_test  = df[(df['d'] >= TEST_DAYS[0]) & (df['d'] <= TEST_DAYS[1])]
-    
-    print(f"Train rows: {len(df_train)}, Test rows: {len(df_test)}")
-    return df_train, df_test
+        self.input_seq_length = input_seq_length
+        self.predict_seq_length = predict_seq_length
+        self.look_back_len = look_back_len
+        self.multiple = multiple
 
+        dataset = pd.DataFrame(dataset)
 
-# =========================================================
-# GLOBAL MEAN
-# =========================================================
-def compute_global_mean(df_train):
-    print("Computing global mean...")
-    
-    mean_x = df_train['x'].mean()
-    mean_y = df_train['y'].mean()
-    
-    print(f"Global Mean: ({mean_x:.6f}, {mean_y:.6f})")
-    return (mean_x, mean_y)
+        # vectorized label
+        dataset['label'] = 200 * (dataset['x'].values - 1) + (dataset['y'].values - 1)
 
+        # memory-safe storage
+        self.user_data = []
+        self.index_map = []
 
-# =========================================================
-# CORE COMPUTATION (PER USER)
-# =========================================================
-def compute_user_geobleu(args):
-    uid, user_df, mean_x, mean_y = args
-    
-    try:
-        ds = user_df['d'].values
-        ts = user_df['t'].values
-        xs = user_df['x'].values
-        ys = user_df['y'].values
+        # 🔥 efficient grouping
+        grouped = dataset.groupby('uid', sort=False)
+        uid_to_indices = grouped.indices
+
+        uids = list(uid_to_indices.keys())
+        total_users = len(uids)
+
+        print(f"Processing {total_users} users...")
+
+        # Process users in parallel batches for better performance
+        batch_size = min(1000, total_users // mp.cpu_count() + 1)
         
-        if len(ds) == 0:
+        for batch_start in tqdm(range(0, total_users, batch_size), desc="User batches", unit="batch"):
+            batch_end = min(batch_start + batch_size, total_users)
+            batch_uids = uids[batch_start:batch_end]
+            
+            # Process batch in parallel
+            with ThreadPoolExecutor(max_workers=min(8, mp.cpu_count())) as executor:
+                batch_results = list(executor.map(self._process_user, 
+                                                 [(uid, uid_to_indices[uid], dataset, input_seq_length, predict_seq_length, look_back_len, subsample, subsample_number, batch_start + i, total_users, multiple) 
+                                                  for i, uid in enumerate(batch_uids)]))
+            
+            # Collect results
+            for result in batch_results:
+                if result is not None:
+                    user_data, index_maps = result
+                    user_idx = len(self.user_data)
+                    self.user_data.append(user_data)
+                    # Adjust user index in index_maps
+                    adjusted_maps = [(user_idx, start) for _, start in index_maps]
+                    self.index_map.extend(adjusted_maps)
+            
+            # Clear memory
+            gc.collect()
+        
+        print(f"Total sequences: {len(self.index_map)}")
+
+    def _process_user(self, args):
+        uid, indices, dataset, input_seq_length, predict_seq_length, look_back_len, subsample, subsample_number, idx, total_users, multiple = args
+        
+        if subsample and idx >= subsample_number:
             return None
+            
+        # zero-copy slice
+        uid_df = dataset.iloc[indices]
+        seq_x, seq_y = self.generate_sequence(uid_df)
         
-        reference = list(zip(ds, ts, xs, ys))
-        predicted = [(d, t, mean_x, mean_y) for d, t in zip(ds, ts)]
+        total_len = len(seq_x)
+        num_seq = (total_len - input_seq_length - predict_seq_length + 1) // look_back_len
         
-        return calc_geobleu_single(predicted, reference)
-    
-    except Exception:
-        return None
+        if num_seq <= 0:
+            return None
+            
+        predict_user = idx >= (total_users - 3000)
+        index_maps = []
+        
+        for i in range(num_seq):
+            start = i * look_back_len
+            index_maps.append((0, start))  # Will be adjusted later
+            
+            if predict_user:
+                for _ in range(1, multiple):
+                    index_maps.append((0, start))  # Will be adjusted later
+                    
+        return (seq_x, seq_y), index_maps
 
+    # -----------------------------------------------------
+    # FAST SEQUENCE GENERATION (NO ITERROWS)
+    # -----------------------------------------------------
+    def generate_sequence(self, data):
+        uid = data['uid'].values[0]
+
+        d = data['d'].values
+        t = data['t'].values
+        label = data['label'].values
+
+        time_index = t + 48 * d
+        delta_t = np.diff(time_index, prepend=time_index[0])
+
+        seq_x = np.stack([
+            d,
+            t,
+            np.full_like(d, uid),
+            d % 7,
+            t % 24,
+            delta_t
+        ], axis=1)
+
+        return seq_x.astype(np.int64), label.astype(np.int64)
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        user_idx, start = self.index_map[idx]
+        seq_x, seq_y = self.user_data[user_idx]
+
+        x1 = seq_x[start : start + self.input_seq_length]
+        y1 = seq_y[start : start + self.input_seq_length]
+
+        x2 = seq_x[start + self.input_seq_length :
+                   start + self.input_seq_length + self.predict_seq_length]
+
+        y2 = seq_y[start + self.input_seq_length :
+                   start + self.input_seq_length + self.predict_seq_length]
+
+        return (
+            torch.from_numpy(x1),
+            torch.from_numpy(y1),
+            torch.from_numpy(x2),
+            torch.from_numpy(y2)
+        )
 
 # =========================================================
-# MAIN PROCESSING
+# TRAIN TEST LOADER
 # =========================================================
-def compute_all_users(df_test, global_mean):
-    print("Grouping users...")
-    grouped = df_test.groupby('uid', sort=False)
-    
-    mean_x, mean_y = global_mean
-    
-    print("Preparing tasks...")
-    tasks = [(uid, user_df, mean_x, mean_y) for uid, user_df in grouped]
-    
-    print(f"Total users to process: {len(tasks)}")
-    
-    # =====================================================
-    # Parallel / Sequential execution with progress
-    # =====================================================
-    if USE_PARALLEL:
-        print(f"Using multiprocessing ({cpu_count()} cores)...")
-        with Pool(cpu_count()) as p:
-            scores = list(
-                tqdm(
-                    p.imap(compute_user_geobleu, tasks),
-                    total=len(tasks),
-                    desc="Computing Geo-BLEU"
-                )
-            )
+
+def train_test_mob_time_series_dataloader(
+    rank,
+    world_size,
+    city,
+    input_seq_length,
+    predict_seq_length,
+    subsample=False,
+    subsample_number=100,
+    test_size=0.1,
+    batch_size=64,
+    random_seed=42,
+    look_back_len=24):
+
+    if city == 'A':
+        data_path = Path.home() / "Downloads" / "city_A_alldata.parquet"
     else:
-        print("Using sequential processing...")
-        scores = [
-            compute_user_geobleu(task)
-            for task in tqdm(tasks, desc="Computing Geo-BLEU")
-        ]
-    
-    scores = [s for s in scores if s is not None]
-    
-    print(f"Valid scores: {len(scores)}")
-    return np.array(scores)
+        data_path = Path.home() / "Downloads" / f"city_{city}_alldata.parquet"
 
+    print("Loading parquet...")
+    # For large datasets, use pyarrow engine for better performance
+    try:
+        dataset = pd.read_parquet(data_path, engine='pyarrow')
+    except:
+        # Fallback to default engine
+        dataset = pd.read_parquet(data_path)
+    print(f"Loaded {len(dataset)} rows")
+
+    print("Building dataset...")
+    dataset = MobTimeSeriesDataset(
+        dataset,
+        input_seq_length,
+        predict_seq_length,
+        subsample=subsample,
+        subsample_number=subsample_number,
+        look_back_len=look_back_len
+    )
+
+    dataset_size = len(dataset)
+    train_size = int(dataset_size * (1 - test_size))
+    test_size = dataset_size - train_size
+
+    train_dataset, test_dataset = torch.utils.data.random_split(
+        dataset,
+        [train_size, test_size],
+        generator=torch.Generator().manual_seed(random_seed)
+    )
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        drop_last=True,
+        num_workers=min(8, mp.cpu_count()),
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        sampler=test_sampler,
+        drop_last=False,
+        num_workers=min(8, mp.cpu_count()),
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
+
+    return train_loader, test_loader
 
 # =========================================================
-# STATS
+# UID SPLIT (UNCHANGED)
 # =========================================================
-def summarize_scores(scores):
-    print("\n===== GEO-BLEU RESULTS =====")
-    
-    print(f"Users evaluated : {len(scores)}")
-    print(f"Mean            : {np.mean(scores):.6f}")
-    print(f"Median          : {np.median(scores):.6f}")
-    print(f"Std Dev         : {np.std(scores):.6f}")
-    print(f"Min             : {np.min(scores):.6f}")
-    print(f"Max             : {np.max(scores):.6f}")
-    
-    print("============================\n")
 
+def split_df_by_uid(city, test_size=0.1, random_seed=None,
+                   subsample=False, subsample_number=100):
+
+    if city == 'A':
+        data_path = Path.home() / "Downloads" / "city_A_alldata.parquet"
+    else:
+        data_path = Path.home() / "Downloads" / f"city_{city}_alldata.parquet"
+
+    df = pd.read_parquet(data_path)
+
+    if subsample:
+        uids = df['uid'].unique()[:subsample_number]
+        df = df[df['uid'].isin(uids)]
+
+    uids = df['uid'].unique()
+
+    generate_uid_list = uids[-3000:]
+    generate_df = df[df['uid'].isin(generate_uid_list)]
+
+    remain_df = df[df['x'] != 999]
+
+    selected_uids = uids[:-3000]
+
+    _, test_uids = train_test_split(
+        selected_uids,
+        test_size=test_size,
+        random_state=random_seed
+    )
+
+    test_df = remain_df[remain_df['uid'].isin(test_uids)]
+    train_df = remain_df[~remain_df['uid'].isin(test_uids)]
+
+    partial_generate_df = generate_df[generate_df['d'] < 60]
+    partial_test_df = remain_df[remain_df['d'] < 60]
+
+    train_df = pd.concat([train_df, partial_test_df, partial_generate_df])
+
+    return train_df, test_df, generate_df
 
 # =========================================================
-# MAIN
+# GENERATE MODE LOADER (RESTORED)
 # =========================================================
-def main():
-    df = load_data(DATA_PATH)
-    
-    df_train, df_test = preprocess(df)
-    
-    global_mean = compute_global_mean(df_train)
-    
-    scores = compute_all_users(df_test, global_mean)
-    
-    summarize_scores(scores)
 
+def train_test_generate_mob_time_series_dataloader(
+    city,
+    input_seq_length,
+    predict_seq_length,
+    subsample=False,
+    subsample_number=100,
+    test_size=0.1,
+    batch_size=64,
+    random_seed=42,
+    look_back_len=24,
+    world_size=None,
+    rank=None,
+    multiple=2):
 
-if __name__ == "__main__":
-    main()
+    train_df, test_df, generate_df = split_df_by_uid(
+        city,
+        test_size=test_size,
+        random_seed=random_seed,
+        subsample=subsample,
+        subsample_number=subsample_number
+    )
+
+    dataset = MobTimeSeriesDataset(
+        train_df,
+        input_seq_length,
+        predict_seq_length,
+        look_back_len=look_back_len,
+        multiple=multiple
+    )
+
+    if world_size is not None and rank is not None:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+
+        train_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True
+        )
+    else:
+        train_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=4,
+            pin_memory=True
+        )
+
+    return train_loader, test_df, generate_df
