@@ -1,24 +1,5 @@
 # ST-MoE-BERT: A Spatial-Temporal Mixture-of-Experts Framework for Long-Term Cross-City Mobility Prediction
 
-![GitHub License](https://img.shields.io/github/license/he-h/HuMob)
-![Static Badge](https://img.shields.io/badge/HuMob_Challenge_2024_DTW-rank_1-blue)
-
-
-
-✨ If you find this resource helpful, please consider citing our paper:
-
-```bibtex
-@inproceedings{he2024st,
-  title={ST-MoE-BERT: A Spatial-Temporal Mixture-of-Experts Framework for Long-Term Cross-City Mobility Prediction},
-  author={He, Haoyu and Luo, Haozheng and Wang, Qi R},
-  booktitle={Proceedings of the 2nd ACM SIGSPATIAL International Workshop on Human Mobility Prediction Challenge},
-  pages={10--15},
-  year={2024}
-}
-```
-
-🚩 **News** (October 2024): We achieve first place in Dynamic Time Wrapping (DTW) metric out of 100+ teams at [HuMob 2024](https://wp.nyu.edu/humobchallenge2024/). Check out our paper [here](https://arxiv.org/abs/2410.14099)!
-
 ## Introduction
 
 This repository contains the code for the paper "ST-MoE-BERT: A Spatial-Temporal Mixture-of-Experts Framework for Long-Term Cross-City Mobility Prediction". The code is based on the [ST-MoE-BERT](https://arxiv.org/abs/2410.14099). The pre-trained model is available on [Hugging Face](https://huggingface.co/h-h-y/ST-MoE-BERT) for easy access and deployment.
