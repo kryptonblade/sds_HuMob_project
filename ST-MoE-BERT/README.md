@@ -82,3 +82,8 @@ for morton encoded code(current code)
 ```bash
 python3 expert_analyzer_morton.py 
 ```
+
+note: we took the ST-MoE-BERT implementation from ST-MoE-BERT: A Spatial-Temporal Mixture-of-Experts Framework for Long-Term Cross-City Mobility Prediction,
+authors: He, Haoyu and Luo, Haozheng and Wang, Qi R
+
+we did feature engineering on the existing model, also our unique take is to use morton encoding instead of row major encoding to preserve spatial proximity during conversion from 2D to 1D.
